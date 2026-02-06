@@ -7,6 +7,7 @@
 (define-constant ERR_INVALID_PRICE (err u105))
 (define-constant ERR_ALREADY_HAS_POSITION (err u106))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u107))
+(define-constant ERR_INVALID_PERCENTAGE (err u108))
 
 (define-constant LIQUIDATION_THRESHOLD u8000)
 (define-constant MAINTENANCE_MARGIN u1000)
@@ -174,6 +175,42 @@
         (var-set total-short-positions (- (var-get total-short-positions) position-size))
     )
     (ok final-balance)))
+)
+
+(define-public (partial-close-position (percentage uint))
+    (let (
+        (position (unwrap! (map-get? positions tx-sender) ERR_POSITION_NOT_FOUND))
+        (pnl (unwrap! (calculate-pnl tx-sender) ERR_POSITION_NOT_FOUND))
+        (collateral (get collateral position))
+        (position-size (get position-size position))
+        (is-long (get is-long position))
+        (current-balance (get-user-balance tx-sender))
+    )
+    (asserts! (and (>= percentage u1) (<= percentage u99)) ERR_INVALID_PERCENTAGE)
+    (let (
+        (partial-pnl (/ (* pnl (to-int percentage)) 100))
+        (partial-collateral (/ (* collateral percentage) u100))
+        (partial-size (/ (* position-size percentage) u100))
+        (remaining-collateral (- collateral partial-collateral))
+        (remaining-size (- position-size partial-size))
+        (freed-balance (if (> partial-pnl 0)
+            (+ partial-collateral (to-uint partial-pnl))
+            (if (>= partial-collateral (to-uint (- 0 partial-pnl)))
+                (- partial-collateral (to-uint (- 0 partial-pnl)))
+                u0
+            )
+        ))
+    )
+    (map-set user-balances tx-sender (+ current-balance freed-balance))
+    (map-set positions tx-sender (merge position {
+        collateral: remaining-collateral,
+        position-size: remaining-size
+    }))
+    (if is-long
+        (var-set total-long-positions (- (var-get total-long-positions) partial-size))
+        (var-set total-short-positions (- (var-get total-short-positions) partial-size))
+    )
+    (ok freed-balance)))
 )
 
 (define-public (liquidate (user principal))
