@@ -11,8 +11,6 @@
 (define-constant ERR_INVALID_PERCENTAGE (err u108))
 (define-constant ERR_INVALID_INCREASE (err u109))
 (define-constant ERR_MARKET_NOT_FOUND (err u110))
-(define-constant ERR_UNAUTHORIZED_ORACLE (err u111))
-(define-constant ERR_ORACLE_PRICE_FAILED (err u112))
 
 (define-constant LIQUIDATION_THRESHOLD u8000)
 (define-constant MAINTENANCE_MARGIN u1000)
@@ -25,6 +23,7 @@
     uint
     {
         asset-name: (string-ascii 32),
+        price: uint,
         total-long-oi: uint,
         total-short-oi: uint,
         funding-rate: int,
@@ -53,11 +52,6 @@
     uint
 )
 
-(define-map authorized-oracles
-    principal
-    bool
-)
-
 (define-read-only (get-market (market-id uint))
     (map-get? markets market-id)
 )
@@ -74,10 +68,6 @@
     (default-to u0 (map-get? user-open-positions user))
 )
 
-(define-read-only (is-oracle-authorized (oracle principal))
-    (default-to false (map-get? authorized-oracles oracle))
-)
-
 (define-read-only (calculate-position-value
         (position-size uint)
         (current-price uint)
@@ -85,9 +75,11 @@
     (/ (* position-size current-price) PRECISION)
 )
 
-(define-read-only (calculate-pnl (user principal) (market-id uint) (current-price uint))
+(define-read-only (calculate-pnl (user principal) (market-id uint))
     (let (
             (position (unwrap! (get-position user market-id) (err ERR_POSITION_NOT_FOUND)))
+            (market (unwrap! (get-market market-id) (err ERR_MARKET_NOT_FOUND)))
+            (current-price (get price market))
             (entry-price (get entry-price position))
             (position-size (get position-size position))
             (is-long (get is-long position))
@@ -109,12 +101,15 @@
     )
 )
 
-(define-read-only (calculate-margin-ratio (user principal) (market-id uint) (current-price uint))
+(define-read-only (calculate-margin-ratio (user principal) (market-id uint))
     (let (
             (position (unwrap! (get-position user market-id) (err ERR_POSITION_NOT_FOUND)))
-            (pnl (unwrap! (calculate-pnl user market-id current-price) (err ERR_POSITION_NOT_FOUND)))
+            (market (unwrap! (get-market market-id) (err ERR_MARKET_NOT_FOUND)))
+            (pnl (unwrap! (calculate-pnl user market-id) (err ERR_POSITION_NOT_FOUND)))
             (collateral (get collateral position))
-            (position-value (calculate-position-value (get position-size position) current-price))
+            (position-value (calculate-position-value (get position-size position)
+                (get price market)
+            ))
         )
         (if (> pnl 0)
             (ok (/ (* (+ collateral (to-uint pnl)) PRECISION) position-value))
@@ -128,19 +123,12 @@
     )
 )
 
-(define-read-only (is-liquidatable (user principal) (market-id uint) (current-price uint))
-    (let ((margin-ratio-result (calculate-margin-ratio user market-id current-price)))
+(define-read-only (is-liquidatable (user principal) (market-id uint))
+    (let ((margin-ratio-result (calculate-margin-ratio user market-id)))
         (match margin-ratio-result
             margin-ratio (ok (< margin-ratio MAINTENANCE_MARGIN))
             error (ok false)
         )
-    )
-)
-
-(define-public (set-oracle-authorization (oracle principal) (authorized bool))
-    (begin
-        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        (ok (map-set authorized-oracles oracle authorized))
     )
 )
 
@@ -166,11 +154,13 @@
     )
 )
 
-(define-public (create-market (asset-name (string-ascii 32)))
+(define-public (create-market (asset-name (string-ascii 32)) (initial-price uint))
     (let ((new-market-id (+ (var-get market-count) u1)))
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> initial-price u0) ERR_INVALID_PRICE)
         (map-set markets new-market-id {
             asset-name: asset-name,
+            price: initial-price,
             total-long-oi: u0,
             total-short-oi: u0,
             funding-rate: 0,
@@ -186,47 +176,44 @@
         (collateral-amount uint)
         (position-size uint)
         (is-long bool)
-        (oracle <oracle-trait>)
     )
     (let (
             (current-balance (get-user-balance tx-sender))
             (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
+            (current-price (get price market))
             (open-positions-count (get-user-open-positions tx-sender))
         )
-        (asserts! (is-oracle-authorized (contract-of oracle)) ERR_UNAUTHORIZED_ORACLE)
-        (let ((current-price (unwrap! (contract-call? oracle get-price market-id) ERR_ORACLE_PRICE_FAILED)))
-            (asserts! (is-none (get-position tx-sender market-id))
-                ERR_ALREADY_HAS_POSITION
+        (asserts! (is-none (get-position tx-sender market-id))
+            ERR_ALREADY_HAS_POSITION
+        )
+        (asserts! (> collateral-amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (> position-size u0) ERR_INVALID_AMOUNT)
+        (asserts! (>= current-balance collateral-amount) ERR_INSUFFICIENT_BALANCE)
+        (let (
+                (position-value (calculate-position-value position-size current-price))
+                (initial-margin-ratio (/ (* collateral-amount PRECISION) position-value))
             )
-            (asserts! (> collateral-amount u0) ERR_INVALID_AMOUNT)
-            (asserts! (> position-size u0) ERR_INVALID_AMOUNT)
-            (asserts! (>= current-balance collateral-amount) ERR_INSUFFICIENT_BALANCE)
-            (let (
-                    (position-value (calculate-position-value position-size current-price))
-                    (initial-margin-ratio (/ (* collateral-amount PRECISION) position-value))
-                )
-                (asserts! (>= initial-margin-ratio MAINTENANCE_MARGIN)
-                    ERR_INSUFFICIENT_COLLATERAL
-                )
-                (map-set positions { user: tx-sender, market-id: market-id } {
-                    collateral: collateral-amount,
-                    position-size: position-size,
-                    entry-price: current-price,
-                    is-long: is-long,
-                    last-funding-payment: stacks-block-height
+            (asserts! (>= initial-margin-ratio MAINTENANCE_MARGIN)
+                ERR_INSUFFICIENT_COLLATERAL
+            )
+            (map-set positions { user: tx-sender, market-id: market-id } {
+                collateral: collateral-amount,
+                position-size: position-size,
+                entry-price: current-price,
+                is-long: is-long,
+                last-funding-payment: stacks-block-height
+            })
+            (map-set user-balances tx-sender
+                (- current-balance collateral-amount)
+            )
+            (map-set user-open-positions tx-sender (+ open-positions-count u1))
+            (map-set markets market-id
+                (merge market {
+                    total-long-oi: (if is-long (+ (get total-long-oi market) position-size) (get total-long-oi market)),
+                    total-short-oi: (if is-long (get total-short-oi market) (+ (get total-short-oi market) position-size))
                 })
-                (map-set user-balances tx-sender
-                    (- current-balance collateral-amount)
-                )
-                (map-set user-open-positions tx-sender (+ open-positions-count u1))
-                (map-set markets market-id
-                    (merge market {
-                        total-long-oi: (if is-long (+ (get total-long-oi market) position-size) (get total-long-oi market)),
-                        total-short-oi: (if is-long (get total-short-oi market) (+ (get total-short-oi market) position-size))
-                    })
-                )
-                (ok true)
             )
+            (ok true)
         )
     )
 )
@@ -235,13 +222,10 @@
         (market-id uint)
         (add-collateral uint)
         (add-size uint)
-        (oracle <oracle-trait>)
     )
     (begin
         (try! (apply-funding-payment tx-sender market-id))
-        (asserts! (is-oracle-authorized (contract-of oracle)) ERR_UNAUTHORIZED_ORACLE)
         (let (
-                (current-price (unwrap! (contract-call? oracle get-price market-id) ERR_ORACLE_PRICE_FAILED))
                 (position (unwrap! (get-position tx-sender market-id) ERR_POSITION_NOT_FOUND))
                 (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
                 (current-size (get position-size position))
@@ -249,6 +233,7 @@
                 (current-collateral (get collateral position))
                 (is-long (get is-long position))
                 (user-balance (get-user-balance tx-sender))
+                (current-price (get price market))
             )
             (asserts! (> add-size u0) ERR_INVALID_AMOUNT)
             (if (> add-collateral u0)
@@ -302,124 +287,123 @@
     )
 )
 
-(define-public (close-position (market-id uint) (oracle <oracle-trait>))
-    (begin
-        (asserts! (is-oracle-authorized (contract-of oracle)) ERR_UNAUTHORIZED_ORACLE)
-        (let (
-                (current-price (unwrap! (contract-call? oracle get-price market-id) ERR_ORACLE_PRICE_FAILED))
-                (position (unwrap! (get-position tx-sender market-id) ERR_POSITION_NOT_FOUND))
-                (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
-                (pnl (unwrap! (calculate-pnl tx-sender market-id current-price) ERR_POSITION_NOT_FOUND))
-                (collateral (get collateral position))
-                (position-size (get position-size position))
-                (is-long (get is-long position))
-                (current-balance (get-user-balance tx-sender))
-                (open-positions-count (get-user-open-positions tx-sender))
-            )
-            (let ((final-balance (if (> pnl 0)
-                    (+ collateral (to-uint pnl))
-                    (if (>= collateral (to-uint (- 0 pnl)))
-                        (- collateral (to-uint (- 0 pnl)))
-                        u0
-                    )
-                )))
-                (map-set user-balances tx-sender (+ current-balance final-balance))
-                (map-delete positions { user: tx-sender, market-id: market-id })
-                (map-set user-open-positions tx-sender (- open-positions-count u1))
-                
-                (map-set markets market-id
-                    (merge market {
-                        total-long-oi: (if is-long (- (get total-long-oi market) position-size) (get total-long-oi market)),
-                        total-short-oi: (if is-long (get total-short-oi market) (- (get total-short-oi market) position-size))
-                    })
+(define-public (close-position (market-id uint))
+    (let (
+            (position (unwrap! (get-position tx-sender market-id) ERR_POSITION_NOT_FOUND))
+            (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
+            (pnl (unwrap! (calculate-pnl tx-sender market-id) ERR_POSITION_NOT_FOUND))
+            (collateral (get collateral position))
+            (position-size (get position-size position))
+            (is-long (get is-long position))
+            (current-balance (get-user-balance tx-sender))
+            (open-positions-count (get-user-open-positions tx-sender))
+        )
+        (let ((final-balance (if (> pnl 0)
+                (+ collateral (to-uint pnl))
+                (if (>= collateral (to-uint (- 0 pnl)))
+                    (- collateral (to-uint (- 0 pnl)))
+                    u0
                 )
-                (ok final-balance)
+            )))
+            (map-set user-balances tx-sender (+ current-balance final-balance))
+            (map-delete positions { user: tx-sender, market-id: market-id })
+            (map-set user-open-positions tx-sender (- open-positions-count u1))
+            
+            (map-set markets market-id
+                (merge market {
+                    total-long-oi: (if is-long (- (get total-long-oi market) position-size) (get total-long-oi market)),
+                    total-short-oi: (if is-long (get total-short-oi market) (- (get total-short-oi market) position-size))
+                })
             )
+            (ok final-balance)
         )
     )
 )
 
-(define-public (partial-close-position (market-id uint) (percentage uint) (oracle <oracle-trait>))
-    (begin
+(define-public (partial-close-position (market-id uint) (percentage uint))
+    (let (
+            (position (unwrap! (get-position tx-sender market-id) ERR_POSITION_NOT_FOUND))
+            (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
+            (pnl (unwrap! (calculate-pnl tx-sender market-id) ERR_POSITION_NOT_FOUND))
+            (collateral (get collateral position))
+            (position-size (get position-size position))
+            (is-long (get is-long position))
+            (current-balance (get-user-balance tx-sender))
+        )
         (asserts! (and (>= percentage u1) (<= percentage u99))
             ERR_INVALID_PERCENTAGE
         )
-        (asserts! (is-oracle-authorized (contract-of oracle)) ERR_UNAUTHORIZED_ORACLE)
         (let (
-                (current-price (unwrap! (contract-call? oracle get-price market-id) ERR_ORACLE_PRICE_FAILED))
-                (position (unwrap! (get-position tx-sender market-id) ERR_POSITION_NOT_FOUND))
-                (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
-                (pnl (unwrap! (calculate-pnl tx-sender market-id current-price) ERR_POSITION_NOT_FOUND))
-                (collateral (get collateral position))
-                (position-size (get position-size position))
-                (is-long (get is-long position))
-                (current-balance (get-user-balance tx-sender))
+                (partial-pnl (/ (* pnl (to-int percentage)) 100))
+                (partial-collateral (/ (* collateral percentage) u100))
+                (partial-size (/ (* position-size percentage) u100))
+                (remaining-collateral (- collateral partial-collateral))
+                (remaining-size (- position-size partial-size))
+                (freed-balance (if (> partial-pnl 0)
+                    (+ partial-collateral (to-uint partial-pnl))
+                    (if (>= partial-collateral (to-uint (- 0 partial-pnl)))
+                        (- partial-collateral (to-uint (- 0 partial-pnl)))
+                        u0
+                    )
+                ))
             )
-            (let (
-                    (partial-pnl (/ (* pnl (to-int percentage)) 100))
-                    (partial-collateral (/ (* collateral percentage) u100))
-                    (partial-size (/ (* position-size percentage) u100))
-                    (remaining-collateral (- collateral partial-collateral))
-                    (remaining-size (- position-size partial-size))
-                    (freed-balance (if (> partial-pnl 0)
-                        (+ partial-collateral (to-uint partial-pnl))
-                        (if (>= partial-collateral (to-uint (- 0 partial-pnl)))
-                            (- partial-collateral (to-uint (- 0 partial-pnl)))
-                            u0
-                        )
-                    ))
-                )
-                (map-set user-balances tx-sender (+ current-balance freed-balance))
-                (map-set positions { user: tx-sender, market-id: market-id }
-                    (merge position {
-                        collateral: remaining-collateral,
-                        position-size: remaining-size
-                    })
-                )
-                
-                (map-set markets market-id
-                    (merge market {
-                        total-long-oi: (if is-long (- (get total-long-oi market) partial-size) (get total-long-oi market)),
-                        total-short-oi: (if is-long (get total-short-oi market) (- (get total-short-oi market) partial-size))
-                    })
-                )
-                (ok freed-balance)
+            (map-set user-balances tx-sender (+ current-balance freed-balance))
+            (map-set positions { user: tx-sender, market-id: market-id }
+                (merge position {
+                    collateral: remaining-collateral,
+                    position-size: remaining-size
+                })
             )
+            
+            (map-set markets market-id
+                (merge market {
+                    total-long-oi: (if is-long (- (get total-long-oi market) partial-size) (get total-long-oi market)),
+                    total-short-oi: (if is-long (get total-short-oi market) (- (get total-short-oi market) partial-size))
+                })
+            )
+            (ok freed-balance)
         )
     )
 )
 
-(define-public (liquidate (user principal) (market-id uint) (oracle <oracle-trait>))
-    (begin
-        (asserts! (is-oracle-authorized (contract-of oracle)) ERR_UNAUTHORIZED_ORACLE)
-        (let (
-                (current-price (unwrap! (contract-call? oracle get-price market-id) ERR_ORACLE_PRICE_FAILED))
-                (liquidatable (unwrap! (is-liquidatable user market-id current-price) ERR_POSITION_NOT_FOUND))
-                (position (unwrap! (get-position user market-id) ERR_POSITION_NOT_FOUND))
-                (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
-                (position-size (get position-size position))
-                (is-long (get is-long position))
-                (liquidator-balance (get-user-balance tx-sender))
-                (open-positions-count (get-user-open-positions user))
-            )
-            (asserts! liquidatable ERR_POSITION_HEALTHY)
-            (map-delete positions { user: user, market-id: market-id })
-            (map-set user-open-positions user (- open-positions-count u1))
-            
-            (let ((liquidation-reward (/ (get collateral position) u10)))
-                (map-set user-balances tx-sender
-                    (+ liquidator-balance liquidation-reward)
-                )
-                
-                (map-set markets market-id
-                    (merge market {
-                        total-long-oi: (if is-long (- (get total-long-oi market) position-size) (get total-long-oi market)),
-                        total-short-oi: (if is-long (get total-short-oi market) (- (get total-short-oi market) position-size))
-                    })
-                )
-                (ok liquidation-reward)
-            )
+(define-public (liquidate (user principal) (market-id uint))
+    (let (
+            (liquidatable (unwrap! (is-liquidatable user market-id) ERR_POSITION_NOT_FOUND))
+            (position (unwrap! (get-position user market-id) ERR_POSITION_NOT_FOUND))
+            (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
+            (position-size (get position-size position))
+            (is-long (get is-long position))
+            (liquidator-balance (get-user-balance tx-sender))
+            (open-positions-count (get-user-open-positions user))
         )
+        (asserts! liquidatable ERR_POSITION_HEALTHY)
+        (map-delete positions { user: user, market-id: market-id })
+        (map-set user-open-positions user (- open-positions-count u1))
+        
+        (let ((liquidation-reward (/ (get collateral position) u10)))
+            (map-set user-balances tx-sender
+                (+ liquidator-balance liquidation-reward)
+            )
+            
+            (map-set markets market-id
+                (merge market {
+                    total-long-oi: (if is-long (- (get total-long-oi market) position-size) (get total-long-oi market)),
+                    total-short-oi: (if is-long (get total-short-oi market) (- (get total-short-oi market) position-size))
+                })
+            )
+            (ok liquidation-reward)
+        )
+    )
+)
+
+(define-public (update-market-price (market-id uint) (new-price uint))
+    (let ((market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND)))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-price u0) ERR_INVALID_PRICE)
+        (map-set markets market-id
+            (merge market { price: new-price })
+        )
+        (ok true)
     )
 )
 
