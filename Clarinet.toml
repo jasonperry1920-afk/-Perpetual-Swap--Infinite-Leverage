@@ -21,3 +21,8 @@ callee_filter = false
 [repl.remote_data]
 enabled = false
 api_url = 'https://api.hiro.so'
+
+[contracts.oracle-trait]
+path = 'contracts/oracle-trait.clar'
+clarity_version = 3
+epoch = 'latest'
