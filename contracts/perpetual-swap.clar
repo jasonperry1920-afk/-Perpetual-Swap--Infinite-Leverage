@@ -1,10 +1,11 @@
+(use-trait oracle-trait .oracle-trait.oracle-trait)
+
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_UNAUTHORIZED (err u100))
 (define-constant ERR_INSUFFICIENT_COLLATERAL (err u101))
 (define-constant ERR_POSITION_NOT_FOUND (err u102))
 (define-constant ERR_INVALID_AMOUNT (err u103))
 (define-constant ERR_POSITION_HEALTHY (err u104))
-(define-constant ERR_INVALID_PRICE (err u105))
 (define-constant ERR_ALREADY_HAS_POSITION (err u106))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u107))
 (define-constant ERR_INVALID_PERCENTAGE (err u108))
