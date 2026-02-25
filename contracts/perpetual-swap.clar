@@ -1,4 +1,4 @@
-(use-trait oracle-trait .oracle-trait.oracle-trait)
+(use-trait oracle-trait .oracle-trait.oracle-trait)        
 
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_UNAUTHORIZED (err u100))
@@ -52,6 +52,18 @@
     }
 )
 
+(define-map orderbook
+    uint
+    {
+        user: principal,
+        market-id: uint,
+        collateral-amount: uint,
+        position-size: uint,
+        is-long: bool,
+        created-at-block: uint
+    }
+)
+
 (define-map user-balances
     principal
     uint
@@ -84,6 +96,10 @@
         user: user,
         market-id: market-id,
     })
+)
+
+(define-read-only (get-order (order-id uint))
+    (map-get? orderbook order-id)
 )
 
 (define-read-only (get-user-balance (user principal))
@@ -320,12 +336,11 @@
     )
 )
 
-(define-public (open-position
+(define-public (request-open-position
         (market-id uint)
         (collateral-amount uint)
         (position-size uint)
         (is-long bool)
-        (oracle <oracle-trait>)
     )
     (let (
             (current-balance (get-user-balance tx-sender))
@@ -394,6 +409,8 @@
                         ),
                     })
                 )
+                
+                (map-delete orderbook order-id)
                 (ok true)
             )
         )
