@@ -1,4 +1,4 @@
-(use-trait oracle-trait .oracle-trait.oracle-trait)        
+(use-trait oracle-trait .oracle-trait.oracle-trait)
 
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_UNAUTHORIZED (err u100))
@@ -15,12 +15,14 @@
 (define-constant ERR_ORACLE_PRICE_FAILED (err u112))
 (define-constant ERR_INVALID_FEE_RATE (err u113))
 (define-constant ERR_INSUFFICIENT_FEES (err u114))
+(define-constant ERR_BLOCK_TOO_EARLY (err u116))
 
 (define-constant LIQUIDATION_THRESHOLD u8000)
 (define-constant MAINTENANCE_MARGIN u1000)
 (define-constant FUNDING_RATE_DIVISOR u1000000)
 (define-constant PRECISION u10000)
 (define-constant MAX_FEE_RATE u500) ;; Max 5% fee rate (bps)
+(define-constant FUNDING_EPOCH_LENGTH u6) ;; ~1 hour based on 10 min Stacks blocks
 
 (define-data-var market-count uint u0)
 (define-data-var global-locked-collateral uint u0)
@@ -34,6 +36,7 @@
         total-long-oi: uint,
         total-short-oi: uint,
         funding-rate: int,
+        cumulative-funding: int,
         last-funding-update: uint,
     }
 )
@@ -48,7 +51,7 @@
         position-size: uint,
         entry-price: uint,
         is-long: bool,
-        last-funding-payment: uint,
+        last-funding-index: int,
     }
 )
 
@@ -60,7 +63,7 @@
         collateral-amount: uint,
         position-size: uint,
         is-long: bool,
-        created-at-block: uint
+        created-at-block: uint,
     }
 )
 
@@ -329,6 +332,7 @@
             total-long-oi: u0,
             total-short-oi: u0,
             funding-rate: 0,
+            cumulative-funding: 0,
             last-funding-update: stacks-block-height,
         })
         (var-set market-count new-market-id)
@@ -341,6 +345,7 @@
         (collateral-amount uint)
         (position-size uint)
         (is-long bool)
+        (oracle <oracle-trait>)
     )
     (let (
             (current-balance (get-user-balance tx-sender))
@@ -380,7 +385,7 @@
                     position-size: position-size,
                     entry-price: current-price,
                     is-long: is-long,
-                    last-funding-payment: stacks-block-height,
+                    last-funding-index: (get cumulative-funding market),
                 })
                 (map-set user-balances tx-sender
                     (- current-balance total-required)
@@ -409,8 +414,6 @@
                         ),
                     })
                 )
-                
-                (map-delete orderbook order-id)
                 (ok true)
             )
         )
@@ -502,6 +505,7 @@
                         collateral: total-new-collateral,
                         position-size: total-new-size,
                         entry-price: new-entry-price,
+                        last-funding-index: (get cumulative-funding market),
                     })
                 )
 
@@ -825,32 +829,45 @@
             (total-long (get total-long-oi market))
             (total-short (get total-short-oi market))
             (total-positions (+ total-long total-short))
+            (blocks-elapsed (- stacks-block-height (get last-funding-update market)))
+            (last-rate (get funding-rate market))
+            (cumulative (get cumulative-funding market))
         )
-        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        (if (> total-positions u0)
-            (let (
-                    (imbalance (if (> total-long total-short)
-                        (to-int (- total-long total-short))
-                        (- 0 (to-int (- total-short total-long)))
-                    ))
-                    (rate (/ (* imbalance (to-int PRECISION)) (to-int total-positions)))
+        ;; Algorithmic Epochs: Anyone can crank this, but only if an epoch has passed.
+        ;; No unauthorized err, this is a public crank function now.
+        (asserts! (>= blocks-elapsed FUNDING_EPOCH_LENGTH) ERR_BLOCK_TOO_EARLY)
+
+        ;; Accumulate the TWAP of the *previous* epoch's rate onto the cumulative index
+        (let ((new-cumulative (+ cumulative (* last-rate (to-int blocks-elapsed)))))
+            (if (> total-positions u0)
+                (let (
+                        (imbalance (if (> total-long total-short)
+                            (to-int (- total-long total-short))
+                            (- 0 (to-int (- total-short total-long)))
+                        ))
+                        (new-rate (/ (* imbalance (to-int PRECISION))
+                            (to-int total-positions)
+                        ))
+                    )
+                    (map-set markets market-id
+                        (merge market {
+                            funding-rate: new-rate,
+                            cumulative-funding: new-cumulative,
+                            last-funding-update: stacks-block-height,
+                        })
+                    )
+                    (ok true)
                 )
-                (map-set markets market-id
-                    (merge market {
-                        funding-rate: rate,
-                        last-funding-update: stacks-block-height,
-                    })
+                (begin
+                    (map-set markets market-id
+                        (merge market {
+                            funding-rate: 0,
+                            cumulative-funding: new-cumulative,
+                            last-funding-update: stacks-block-height,
+                        })
+                    )
+                    (ok true)
                 )
-                (ok true)
-            )
-            (begin
-                (map-set markets market-id
-                    (merge market {
-                        funding-rate: 0,
-                        last-funding-update: stacks-block-height,
-                    })
-                )
-                (ok true)
             )
         )
     )
@@ -863,59 +880,64 @@
     (let (
             (position (unwrap! (get-position user market-id) ERR_POSITION_NOT_FOUND))
             (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
-            (blocks-elapsed (- stacks-block-height (get last-funding-payment position)))
-            (funding (get funding-rate market))
+            (last-index (get last-funding-index position))
+            (current-index (get cumulative-funding market))
             (position-size (get position-size position))
             (is-long (get is-long position))
+            (collateral (get collateral position))
         )
-        (if (> blocks-elapsed u0)
+        (if (not (is-eq current-index last-index))
             (let (
-                    (payment-calc (/
-                        (*
-                            (if (> funding 0)
-                                (to-uint funding)
-                                (to-uint (- 0 funding))
-                            )
-                            position-size blocks-elapsed
-                        )
-                        FUNDING_RATE_DIVISOR
+                    (index-delta (- current-index last-index))
+                    (payment-calc-int (/ (* (to-int position-size) index-delta)
+                        (to-int FUNDING_RATE_DIVISOR)
                     ))
-                    (collateral (get collateral position))
-                    (should-deduct (or (and is-long (> funding 0)) (and (not is-long) (< funding 0))))
-                    (new-collateral (if should-deduct
-                        (if (>= collateral payment-calc)
-                            (- collateral payment-calc)
-                            u0
-                        )
-                        (+ collateral payment-calc)
+                    ;; If long, a positive index delta means longs pay shorts. 
+                    ;; So if is-long is true and delta is positive, we deduct from long.
+                    ;; mathematical rule:
+                    ;; long impact = -1 * payment-calc-int
+                    ;; short impact = +1 * payment-calc-int
+                    (long-impact (- 0 payment-calc-int))
+                    (short-impact payment-calc-int)
+                    (pnl-impact (if is-long
+                        long-impact
+                        short-impact
                     ))
                 )
-                (map-set positions {
-                    user: user,
-                    market-id: market-id,
-                }
-                    (merge position {
-                        collateral: new-collateral,
-                        last-funding-payment: stacks-block-height,
-                    })
+                (let ((new-collateral (if (> pnl-impact 0)
+                        (+ collateral (to-uint pnl-impact))
+                        (if (>= collateral (to-uint (- 0 pnl-impact)))
+                            (- collateral (to-uint (- 0 pnl-impact)))
+                            u0 ;; liquidated essentially, collateral wiped by funding
+                        )
+                    )))
+                    (map-set positions {
+                        user: user,
+                        market-id: market-id,
+                    }
+                        (merge position {
+                            collateral: new-collateral,
+                            last-funding-index: current-index,
+                        })
+                    )
+                    (var-set global-locked-collateral
+                        (if (>= new-collateral collateral)
+                            (+ (var-get global-locked-collateral)
+                                (- new-collateral collateral)
+                            )
+                            (if (>= (var-get global-locked-collateral)
+                                    (- collateral new-collateral)
+                                )
+                                (- (var-get global-locked-collateral)
+                                    (- collateral new-collateral)
+                                )
+                                u0
+                            )
+                        ))
+                    (ok new-collateral)
                 )
-                (var-set global-locked-collateral
-                    (if (>= new-collateral collateral)
-                        (+ (var-get global-locked-collateral)
-                            (- new-collateral collateral)
-                        )
-                        (if (>= (var-get global-locked-collateral)
-                                (- collateral new-collateral)
-                            )
-                            (- (var-get global-locked-collateral)
-                                (- collateral new-collateral)
-                            )
-                            u0
-                        )
-                    ))
-                (ok new-collateral)
             )
-            (ok (get collateral position))
+            (ok collateral)
         )
     )
 )
