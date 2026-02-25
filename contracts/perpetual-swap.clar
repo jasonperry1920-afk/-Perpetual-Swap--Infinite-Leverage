@@ -1,4 +1,4 @@
-(use-trait oracle-trait .oracle-trait.oracle-trait)        
+(use-trait oracle-trait .oracle-trait.oracle-trait)
 
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_UNAUTHORIZED (err u100))
@@ -15,6 +15,8 @@
 (define-constant ERR_ORACLE_PRICE_FAILED (err u112))
 (define-constant ERR_INVALID_FEE_RATE (err u113))
 (define-constant ERR_INSUFFICIENT_FEES (err u114))
+(define-constant ERR_ORDER_NOT_FOUND (err u115))
+(define-constant ERR_BLOCK_TOO_EARLY (err u116))
 
 (define-constant LIQUIDATION_THRESHOLD u8000)
 (define-constant MAINTENANCE_MARGIN u1000)
@@ -26,6 +28,7 @@
 (define-data-var global-locked-collateral uint u0)
 (define-data-var fee-rate-bps uint u10) ;; Default 0.1% fee
 (define-data-var total-fees-collected uint u0)
+(define-data-var order-count uint u0)
 
 (define-map markets
     uint
@@ -60,7 +63,7 @@
         collateral-amount: uint,
         position-size: uint,
         is-long: bool,
-        created-at-block: uint
+        created-at-block: uint,
     }
 )
 
@@ -332,6 +335,11 @@
             last-funding-update: stacks-block-height,
         })
         (var-set market-count new-market-id)
+        (print {
+            action: "create-market",
+            market-id: new-market-id,
+            asset-name: asset-name,
+        })
         (ok new-market-id)
     )
 )
@@ -345,35 +353,101 @@
     (let (
             (current-balance (get-user-balance tx-sender))
             (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
-            (open-positions-count (get-user-open-positions tx-sender))
-            (user-vol (get-user-volume tx-sender))
+            (new-order-id (+ (var-get order-count) u1))
         )
+        (asserts! (is-none (get-position tx-sender market-id))
+            ERR_ALREADY_HAS_POSITION
+        )
+        (asserts! (> collateral-amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (> position-size u0) ERR_INVALID_AMOUNT)
+        ;; User locks only their intended margin. The protocol fee will be deducted
+        ;; from their remaining balance during execution.
+        (asserts! (>= current-balance collateral-amount) ERR_INSUFFICIENT_BALANCE)
+
+        (map-set orderbook new-order-id {
+            user: tx-sender,
+            market-id: market-id,
+            collateral-amount: collateral-amount,
+            position-size: position-size,
+            is-long: is-long,
+            created-at-block: stacks-block-height,
+        })
+
+        (map-set user-balances tx-sender (- current-balance collateral-amount))
+        (var-set order-count new-order-id)
+
+        (print {
+            action: "request-open-position",
+            order-id: new-order-id,
+            user: tx-sender,
+            market-id: market-id,
+            collateral-amount: collateral-amount,
+            position-size: position-size,
+            is-long: is-long,
+        })
+        (ok new-order-id)
+    )
+)
+
+(define-public (cancel-open-position (order-id uint))
+    (let (
+            (order (unwrap! (get-order order-id) ERR_ORDER_NOT_FOUND))
+            (user (get user order))
+            (collateral-amount (get collateral-amount order))
+            (current-balance (get-user-balance tx-sender))
+        )
+        (asserts! (is-eq tx-sender user) ERR_UNAUTHORIZED)
+        (map-set user-balances tx-sender (+ current-balance collateral-amount))
+        (map-delete orderbook order-id)
+        (print {
+            action: "cancel-open-position",
+            order-id: order-id,
+        })
+        (ok true)
+    )
+)
+
+(define-public (execute-open-position
+        (order-id uint)
+        (oracle <oracle-trait>)
+    )
+    (let (
+            (order (unwrap! (get-order order-id) ERR_ORDER_NOT_FOUND))
+            (user (get user order))
+            (market-id (get market-id order))
+            (collateral-amount (get collateral-amount order))
+            (position-size (get position-size order))
+            (is-long (get is-long order))
+            (created-at (get created-at-block order))
+            (current-balance (get-user-balance user))
+            (market (unwrap! (get-market market-id) ERR_MARKET_NOT_FOUND))
+            (open-positions-count (get-user-open-positions user))
+            (user-vol (get-user-volume user))
+        )
+        (asserts! (> stacks-block-height created-at) ERR_BLOCK_TOO_EARLY)
         (asserts! (is-oracle-authorized (contract-of oracle))
             ERR_UNAUTHORIZED_ORACLE
         )
+
         (let ((current-price (unwrap! (contract-call? oracle get-price market-id)
                 ERR_ORACLE_PRICE_FAILED
             )))
-            (asserts! (is-none (get-position tx-sender market-id))
+            (asserts! (is-none (get-position user market-id))
                 ERR_ALREADY_HAS_POSITION
             )
-            (asserts! (> collateral-amount u0) ERR_INVALID_AMOUNT)
-            (asserts! (> position-size u0) ERR_INVALID_AMOUNT)
 
             (let (
                     (position-value (calculate-position-value position-size current-price))
                     (fee (calculate-trading-fee position-value))
-                    (total-required (+ collateral-amount fee))
                     (initial-margin-ratio (/ (* collateral-amount PRECISION) position-value))
                 )
-                (asserts! (>= current-balance total-required)
-                    ERR_INSUFFICIENT_BALANCE
-                )
+                (asserts! (>= current-balance fee) ERR_INSUFFICIENT_BALANCE)
                 (asserts! (>= initial-margin-ratio MAINTENANCE_MARGIN)
                     ERR_INSUFFICIENT_COLLATERAL
                 )
+
                 (map-set positions {
-                    user: tx-sender,
+                    user: user,
                     market-id: market-id,
                 } {
                     collateral: collateral-amount,
@@ -382,21 +456,17 @@
                     is-long: is-long,
                     last-funding-payment: stacks-block-height,
                 })
-                (map-set user-balances tx-sender
-                    (- current-balance total-required)
-                )
+
+                (map-set user-balances user (- current-balance fee))
                 (var-set global-locked-collateral
                     (+ (var-get global-locked-collateral) collateral-amount)
                 )
                 (var-set total-fees-collected
                     (+ (var-get total-fees-collected) fee)
                 )
-                (map-set user-trading-volume tx-sender
-                    (+ user-vol position-value)
-                )
-                (map-set user-open-positions tx-sender
-                    (+ open-positions-count u1)
-                )
+                (map-set user-trading-volume user (+ user-vol position-value))
+                (map-set user-open-positions user (+ open-positions-count u1))
+
                 (map-set markets market-id
                     (merge market {
                         total-long-oi: (if is-long
@@ -409,8 +479,14 @@
                         ),
                     })
                 )
-                
+
                 (map-delete orderbook order-id)
+                (print {
+                    action: "execute-open-position",
+                    order-id: order-id,
+                    market-id: market-id,
+                    entry-price: current-price,
+                })
                 (ok true)
             )
         )
@@ -505,6 +581,13 @@
                     })
                 )
 
+                (print {
+                    action: "increase-position",
+                    user: tx-sender,
+                    market-id: market-id,
+                    add-collateral: add-collateral,
+                    add-size: add-size,
+                })
                 (ok true)
             )
         )
@@ -535,6 +618,12 @@
             (var-set global-locked-collateral
                 (+ (var-get global-locked-collateral) amount)
             )
+            (print {
+                action: "add-margin",
+                user: tx-sender,
+                market-id: market-id,
+                amount: amount,
+            })
             (ok true)
         )
     )
@@ -577,6 +666,12 @@
             (var-set global-locked-collateral
                 (- (var-get global-locked-collateral) amount)
             )
+            (print {
+                action: "remove-margin",
+                user: tx-sender,
+                market-id: market-id,
+                amount: amount,
+            })
             (ok true)
         )
     )
@@ -660,6 +755,12 @@
                                 ),
                             })
                         )
+                        (print {
+                            action: "close-position",
+                            user: tx-sender,
+                            market-id: market-id,
+                            payout: payout-after-fee,
+                        })
                         (ok payout-after-fee)
                     )
                 )
@@ -750,6 +851,13 @@
                             ),
                         })
                     )
+                    (print {
+                        action: "partial-close-position",
+                        user: tx-sender,
+                        market-id: market-id,
+                        percentage: percentage,
+                        freed-balance: freed-balance,
+                    })
                     (ok freed-balance)
                 )
             )
@@ -813,6 +921,13 @@
                         ),
                     })
                 )
+                (print {
+                    action: "liquidate",
+                    user: user,
+                    market-id: market-id,
+                    liquidator: tx-sender,
+                    reward: liquidation-reward,
+                })
                 (ok liquidation-reward)
             )
         )
@@ -841,6 +956,11 @@
                         last-funding-update: stacks-block-height,
                     })
                 )
+                (print {
+                    action: "update-funding-rate",
+                    market-id: market-id,
+                    rate: rate,
+                })
                 (ok true)
             )
             (begin
@@ -850,6 +970,11 @@
                         last-funding-update: stacks-block-height,
                     })
                 )
+                (print {
+                    action: "update-funding-rate",
+                    market-id: market-id,
+                    rate: 0,
+                })
                 (ok true)
             )
         )
