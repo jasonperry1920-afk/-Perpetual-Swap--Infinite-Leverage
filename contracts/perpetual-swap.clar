@@ -16,6 +16,11 @@
 (define-constant ERR_INVALID_FEE_RATE (err u113))
 (define-constant ERR_INSUFFICIENT_FEES (err u114))
 (define-constant ERR_BLOCK_TOO_EARLY (err u116))
+(define-constant ERR_CODE_TAKEN (err u117))
+(define-constant ERR_NO_REFERRER (err u118))
+(define-constant ERR_SELF_REFERRAL (err u119))
+(define-constant ERR_CODE_NOT_FOUND (err u120))
+(define-constant ERR_REFERRER_ALREADY_SET (err u121))
 
 (define-constant LIQUIDATION_THRESHOLD u8000)
 (define-constant MAINTENANCE_MARGIN u1000)
@@ -28,6 +33,7 @@
 (define-constant FEE_TIER1_DISCOUNT u2)
 (define-constant FEE_TIER2_DISCOUNT u4)
 (define-constant FEE_TIER3_DISCOUNT u7)
+(define-constant REFERRAL_REBATE_BPS u1000)
 (define-constant FUNDING_EPOCH_LENGTH u6) ;; ~1 hour based on 10 min Stacks blocks
 
 (define-data-var market-count uint u0)
@@ -93,6 +99,21 @@
     uint
 )
 
+(define-map referral-codes
+    (string-ascii 12)
+    principal
+)
+
+(define-map user-referrer
+    principal
+    principal
+)
+
+(define-map referral-earnings
+    principal
+    uint
+)
+
 (define-read-only (get-market (market-id uint))
     (map-get? markets market-id)
 )
@@ -137,6 +158,22 @@
 
 (define-read-only (get-user-volume (user principal))
     (default-to u0 (map-get? user-trading-volume user))
+)
+
+(define-read-only (get-referral-code-owner (code (string-ascii 12)))
+    (map-get? referral-codes code)
+)
+
+(define-read-only (get-user-referrer (user principal))
+    (map-get? user-referrer user)
+)
+
+(define-read-only (get-referral-earnings (user principal))
+    (default-to u0 (map-get? referral-earnings user))
+)
+
+(define-read-only (calculate-referral-rebate (fee uint))
+    (/ (* fee REFERRAL_REBATE_BPS) u10000)
 )
 
 (define-read-only (get-effective-fee-rate (user principal))
@@ -309,6 +346,34 @@
     )
 )
 
+(define-public (register-referral-code (code (string-ascii 12)))
+    (begin
+        (asserts! (is-none (map-get? referral-codes code)) ERR_CODE_TAKEN)
+        (ok (map-set referral-codes code tx-sender))
+    )
+)
+
+(define-public (set-referrer (code (string-ascii 12)))
+    (let ((referrer (unwrap! (map-get? referral-codes code) ERR_CODE_NOT_FOUND)))
+        (asserts! (is-none (map-get? user-referrer tx-sender)) ERR_REFERRER_ALREADY_SET)
+        (asserts! (not (is-eq referrer tx-sender)) ERR_SELF_REFERRAL)
+        (ok (map-set user-referrer tx-sender referrer))
+    )
+)
+
+(define-public (withdraw-referral-earnings)
+    (let (
+            (earned (get-referral-earnings tx-sender))
+        )
+        (asserts! (> earned u0) ERR_INSUFFICIENT_FEES)
+        (map-set referral-earnings tx-sender u0)
+        (map-set user-balances tx-sender
+            (+ (get-user-balance tx-sender) earned)
+        )
+        (ok earned)
+    )
+)
+
 (define-public (set-oracle-authorization
         (oracle principal)
         (authorized bool)
@@ -430,8 +495,18 @@
                 (var-set global-locked-collateral
                     (+ (var-get global-locked-collateral) collateral-amount)
                 )
-                (var-set total-fees-collected
-                    (+ (var-get total-fees-collected) fee)
+                (let ((rebate (match (map-get? user-referrer tx-sender)
+                        referrer (let ((rebate-amount (calculate-referral-rebate fee)))
+                            (map-set referral-earnings referrer
+                                (+ (get-referral-earnings referrer) rebate-amount)
+                            )
+                            rebate-amount
+                        )
+                        u0
+                    )))
+                    (var-set total-fees-collected
+                        (+ (var-get total-fees-collected) (if (>= fee rebate) (- fee rebate) u0))
+                    )
                 )
                 (map-set user-trading-volume tx-sender
                     (+ user-vol position-value)
@@ -514,8 +589,18 @@
                     )
                     true
                 )
-                (var-set total-fees-collected
-                    (+ (var-get total-fees-collected) fee)
+                (let ((rebate-inc (match (map-get? user-referrer tx-sender)
+                        referrer (let ((rebate-amount (calculate-referral-rebate fee)))
+                            (map-set referral-earnings referrer
+                                (+ (get-referral-earnings referrer) rebate-amount)
+                            )
+                            rebate-amount
+                        )
+                        u0
+                    )))
+                    (var-set total-fees-collected
+                        (+ (var-get total-fees-collected) (if (>= fee rebate-inc) (- fee rebate-inc) u0))
+                    )
                 )
                 (map-set user-trading-volume tx-sender
                     (+ user-vol additional-position-value)
@@ -672,8 +757,18 @@
                         (map-set user-balances tx-sender
                             (+ current-balance payout-after-fee)
                         )
-                        (var-set total-fees-collected
-                            (+ (var-get total-fees-collected) actual-fee)
+                        (let ((rebate-close (match (map-get? user-referrer tx-sender)
+                                referrer (let ((rebate-amount (calculate-referral-rebate actual-fee)))
+                                    (map-set referral-earnings referrer
+                                        (+ (get-referral-earnings referrer) rebate-amount)
+                                    )
+                                    rebate-amount
+                                )
+                                u0
+                            )))
+                            (var-set total-fees-collected
+                                (+ (var-get total-fees-collected) (if (>= actual-fee rebate-close) (- actual-fee rebate-close) u0))
+                            )
                         )
                         (map-delete positions {
                             user: tx-sender,
@@ -772,8 +867,18 @@
                     (var-set global-locked-collateral
                         (- (var-get global-locked-collateral) partial-collateral)
                     )
-                    (var-set total-fees-collected
-                        (+ (var-get total-fees-collected) fee)
+                    (let ((rebate-pc (match (map-get? user-referrer tx-sender)
+                            referrer (let ((rebate-amount (calculate-referral-rebate fee)))
+                                (map-set referral-earnings referrer
+                                    (+ (get-referral-earnings referrer) rebate-amount)
+                                )
+                                rebate-amount
+                            )
+                            u0
+                        )))
+                        (var-set total-fees-collected
+                            (+ (var-get total-fees-collected) (if (>= fee rebate-pc) (- fee rebate-pc) u0))
+                        )
                     )
                     (map-set user-trading-volume tx-sender
                         (+ user-vol partial-position-value)
