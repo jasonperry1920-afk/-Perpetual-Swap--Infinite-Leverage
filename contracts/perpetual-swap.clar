@@ -16,6 +16,7 @@
 (define-constant ERR_INVALID_FEE_RATE (err u113))
 (define-constant ERR_INSUFFICIENT_FEES (err u114))
 (define-constant ERR_BLOCK_TOO_EARLY (err u116))
+(define-constant ERR_KEEPER_POOL_EMPTY (err u117))
 
 (define-constant LIQUIDATION_THRESHOLD u8000)
 (define-constant MAINTENANCE_MARGIN u1000)
@@ -28,12 +29,16 @@
 (define-constant FEE_TIER1_DISCOUNT u2)
 (define-constant FEE_TIER2_DISCOUNT u4)
 (define-constant FEE_TIER3_DISCOUNT u7)
+(define-constant KEEPER_FEE_SHARE_BPS u500)
+(define-constant KEEPER_REWARD_PER_EPOCH u10)
 (define-constant FUNDING_EPOCH_LENGTH u6) ;; ~1 hour based on 10 min Stacks blocks
 
 (define-data-var market-count uint u0)
 (define-data-var global-locked-collateral uint u0)
-(define-data-var fee-rate-bps uint u10) ;; Default 0.1% fee
+(define-data-var fee-rate-bps uint u10)
 (define-data-var total-fees-collected uint u0)
+(define-data-var keeper-reward-pool uint u0)
+(define-data-var total-keeper-rewards-paid uint u0)
 
 (define-map markets
     uint
@@ -137,6 +142,18 @@
 
 (define-read-only (get-user-volume (user principal))
     (default-to u0 (map-get? user-trading-volume user))
+)
+
+(define-read-only (get-keeper-reward-pool)
+    (var-get keeper-reward-pool)
+)
+
+(define-read-only (get-total-keeper-rewards-paid)
+    (var-get total-keeper-rewards-paid)
+)
+
+(define-read-only (calculate-keeper-share (fee uint))
+    (/ (* fee KEEPER_FEE_SHARE_BPS) u10000)
 )
 
 (define-read-only (get-effective-fee-rate (user principal))
@@ -430,8 +447,11 @@
                 (var-set global-locked-collateral
                     (+ (var-get global-locked-collateral) collateral-amount)
                 )
-                (var-set total-fees-collected
-                    (+ (var-get total-fees-collected) fee)
+                (let ((keeper-share (calculate-keeper-share fee)))
+                    (var-set keeper-reward-pool (+ (var-get keeper-reward-pool) keeper-share))
+                    (var-set total-fees-collected
+                        (+ (var-get total-fees-collected) (- fee keeper-share))
+                    )
                 )
                 (map-set user-trading-volume tx-sender
                     (+ user-vol position-value)
@@ -514,8 +534,11 @@
                     )
                     true
                 )
-                (var-set total-fees-collected
-                    (+ (var-get total-fees-collected) fee)
+                (let ((keeper-share (calculate-keeper-share fee)))
+                    (var-set keeper-reward-pool (+ (var-get keeper-reward-pool) keeper-share))
+                    (var-set total-fees-collected
+                        (+ (var-get total-fees-collected) (- fee keeper-share))
+                    )
                 )
                 (map-set user-trading-volume tx-sender
                     (+ user-vol additional-position-value)
@@ -672,8 +695,11 @@
                         (map-set user-balances tx-sender
                             (+ current-balance payout-after-fee)
                         )
-                        (var-set total-fees-collected
-                            (+ (var-get total-fees-collected) actual-fee)
+                        (let ((keeper-share (calculate-keeper-share actual-fee)))
+                            (var-set keeper-reward-pool (+ (var-get keeper-reward-pool) keeper-share))
+                            (var-set total-fees-collected
+                                (+ (var-get total-fees-collected) (- actual-fee keeper-share))
+                            )
                         )
                         (map-delete positions {
                             user: tx-sender,
@@ -772,8 +798,11 @@
                     (var-set global-locked-collateral
                         (- (var-get global-locked-collateral) partial-collateral)
                     )
-                    (var-set total-fees-collected
-                        (+ (var-get total-fees-collected) fee)
+                    (let ((keeper-share (calculate-keeper-share fee)))
+                        (var-set keeper-reward-pool (+ (var-get keeper-reward-pool) keeper-share))
+                        (var-set total-fees-collected
+                            (+ (var-get total-fees-collected) (- fee keeper-share))
+                        )
                     )
                     (map-set user-trading-volume tx-sender
                         (+ user-vol partial-position-value)
@@ -838,8 +867,11 @@
                 (map-set user-balances tx-sender
                     (+ liquidator-balance liquidation-reward)
                 )
-                (var-set total-fees-collected
-                    (+ (var-get total-fees-collected) fee)
+                (let ((keeper-share (calculate-keeper-share fee)))
+                    (var-set keeper-reward-pool (+ (var-get keeper-reward-pool) keeper-share))
+                    (var-set total-fees-collected
+                        (+ (var-get total-fees-collected) (- fee keeper-share))
+                    )
                 )
 
                 (map-set markets market-id
@@ -893,18 +925,27 @@
                             last-funding-update: stacks-block-height,
                         })
                     )
-                    (ok true)
                 )
+                (map-set markets market-id
+                    (merge market {
+                        funding-rate: 0,
+                        cumulative-funding: new-cumulative,
+                        last-funding-update: stacks-block-height,
+                    })
+                )
+            )
+        )
+
+        ;; Payout keeper reward if pool has sufficient funds
+        (let ((pool (var-get keeper-reward-pool)))
+            (if (>= pool KEEPER_REWARD_PER_EPOCH)
                 (begin
-                    (map-set markets market-id
-                        (merge market {
-                            funding-rate: 0,
-                            cumulative-funding: new-cumulative,
-                            last-funding-update: stacks-block-height,
-                        })
-                    )
+                    (var-set keeper-reward-pool (- pool KEEPER_REWARD_PER_EPOCH))
+                    (var-set total-keeper-rewards-paid (+ (var-get total-keeper-rewards-paid) KEEPER_REWARD_PER_EPOCH))
+                    (map-set user-balances tx-sender (+ (get-user-balance tx-sender) KEEPER_REWARD_PER_EPOCH))
                     (ok true)
                 )
+                (ok true)
             )
         )
     )
